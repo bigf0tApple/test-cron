@@ -12,9 +12,14 @@ const ABI = [
     "function accStartTime() external view returns (uint256)",
     "function distStartTime() external view returns (uint256)",
     "function cycleInterval() external view returns (uint256)",
+    "function rewardToken() external view returns (address)",
+    "function getAvailableEthForBuy() external view returns (uint256)",
     "function takeSnapshots() external",
     "function startClaimPhase() external",
     "function endCycle() external",
+    "function buyRewardToken() external",
+    "function distributeAuto() external",
+    "function flushDistributions() external",
     "function currentDisplayCycleId() external view returns (uint256)"
 ];
 
@@ -38,60 +43,112 @@ async function run() {
         const isDistActive = await contract.isDistActive();
         const cycleInterval = await contract.cycleInterval();
         const cycleId = await contract.currentDisplayCycleId();
+        const rewardToken = await contract.rewardToken();
         const now = Math.floor(Date.now() / 1000);
 
         console.log(`Cycle ID: ${cycleId}`);
         console.log(`Is Distribution Active: ${isDistActive}`);
         console.log(`Cycle Interval: ${cycleInterval.toString()} seconds`);
+        console.log(`Reward Token: ${rewardToken}`);
 
         if (!isDistActive) {
-            // We are in ACCUMULATION PHASE
+            // ==================== ACCUMULATION PHASE ====================
             const accStartTime = await contract.accStartTime();
             const elapsed = now - accStartTime.toNumber();
-            console.log(`Accumulation Phase - Elapsed: ${elapsed}s / ${cycleInterval.toString()}s`);
+            console.log(`\n[ACCUMULATION PHASE] Elapsed: ${elapsed}s / ${cycleInterval.toString()}s`);
 
             if (elapsed >= cycleInterval.toNumber()) {
-                console.log("Accumulation phase complete! Taking snapshots...");
+                console.log("Accumulation complete! Starting transition...");
 
-                // Step 1: Take Snapshots
-                let tx = await contract.takeSnapshots({ gasLimit: 2000000 });
-                console.log(`takeSnapshots TX: ${tx.hash}`);
+                // Step 1: Take Snapshots (captures holder points)
+                console.log("1. Taking snapshots...");
+                let tx = await contract.takeSnapshots({ gasLimit: 3000000 });
+                console.log(`   TX: ${tx.hash}`);
                 await tx.wait();
-                console.log("Snapshots taken!");
+                console.log("   ✓ Snapshots taken!");
 
-                // Step 2: Start Claim Phase
-                console.log("Starting claim phase...");
-                tx = await contract.startClaimPhase({ gasLimit: 500000 });
-                console.log(`startClaimPhase TX: ${tx.hash}`);
+                // Step 2: Start Claim Phase (allocates pools, sets isDistActive = true)
+                console.log("2. Starting claim phase...");
+                tx = await contract.startClaimPhase({ gasLimit: 1000000 });
+                console.log(`   TX: ${tx.hash}`);
                 await tx.wait();
-                console.log("Claim phase started! Distribution is now active.");
+                console.log("   ✓ Claim phase started!");
+
+                // Step 3: Buy Reward Token (if set and ETH available)
+                if (rewardToken !== ethers.constants.AddressZero) {
+                    const ethAvailable = await contract.getAvailableEthForBuy();
+                    console.log(`3. Checking reward token purchase... (ETH available: ${ethers.utils.formatEther(ethAvailable)})`);
+
+                    if (ethAvailable.gt(0)) {
+                        console.log("   Buying reward tokens...");
+                        tx = await contract.buyRewardToken({ gasLimit: 500000 });
+                        console.log(`   TX: ${tx.hash}`);
+                        await tx.wait();
+                        console.log("   ✓ Reward tokens purchased!");
+                    } else {
+                        console.log("   No ETH available for purchase.");
+                    }
+                } else {
+                    console.log("3. No reward token set (distributing ETH directly).");
+                }
+
+                console.log("\n✓ Distribution phase is now active!");
             } else {
                 const remaining = cycleInterval.toNumber() - elapsed;
-                console.log(`Not yet time. ${remaining}s remaining until snapshot.`);
+                console.log(`Not yet time. ${remaining}s remaining until transition.`);
             }
+
         } else {
-            // We are in DISTRIBUTION PHASE
+            // ==================== DISTRIBUTION PHASE ====================
             const distStartTime = await contract.distStartTime();
             const elapsed = now - distStartTime.toNumber();
-            console.log(`Distribution Phase - Elapsed: ${elapsed}s / ${cycleInterval.toString()}s`);
+            console.log(`\n[DISTRIBUTION PHASE] Elapsed: ${elapsed}s / ${cycleInterval.toString()}s`);
+
+            // Try to process some auto distributions
+            console.log("Processing auto distributions...");
+            try {
+                const tx = await contract.distributeAuto({ gasLimit: 1000000 });
+                console.log(`   TX: ${tx.hash}`);
+                await tx.wait();
+                console.log("   ✓ Auto distribution batch processed.");
+            } catch (e) {
+                console.log("   No distributions to process or already complete.");
+            }
 
             if (elapsed >= cycleInterval.toNumber()) {
-                console.log("Distribution phase complete! Ending cycle...");
+                console.log("\nDistribution phase complete! Ending cycle...");
 
+                // Flush any remaining distributions
+                console.log("1. Flushing remaining distributions...");
+                try {
+                    let tx = await contract.flushDistributions({ gasLimit: 3000000 });
+                    console.log(`   TX: ${tx.hash}`);
+                    await tx.wait();
+                    console.log("   ✓ Distributions flushed!");
+                } catch (e) {
+                    console.log("   Flush skipped (nothing to flush).");
+                }
+
+                // End the cycle (sweeps unclaimed to treasury)
+                console.log("2. Ending cycle...");
                 const tx = await contract.endCycle({ gasLimit: 2000000 });
-                console.log(`endCycle TX: ${tx.hash}`);
+                console.log(`   TX: ${tx.hash}`);
                 await tx.wait();
-                console.log("Cycle ended! New accumulation phase started.");
+                console.log("   ✓ Cycle ended! New accumulation phase started.");
+
             } else {
                 const remaining = cycleInterval.toNumber() - elapsed;
-                console.log(`Not yet time. ${remaining}s remaining until cycle end.`);
+                console.log(`Not yet time to end. ${remaining}s remaining.`);
             }
         }
 
-        console.log("Cron job complete.");
+        console.log("\n✓ Cron job complete.");
 
     } catch (error) {
-        console.error("Error running cron:", error.reason || error.message);
+        console.error("\n✗ Error:", error.reason || error.message);
+        if (error.error?.data) {
+            console.error("  Data:", error.error.data);
+        }
         process.exit(1);
     }
 }
