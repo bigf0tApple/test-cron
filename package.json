@@ -1,0 +1,13 @@
+{
+    "name": "wee-rewards-cron",
+    "version": "1.0.0",
+    "description": "Cron job to trigger endCycle on WEE RewardsContract",
+    "main": "index.js",
+    "scripts": {
+        "start": "node index.js"
+    },
+    "dependencies": {
+        "ethers": "^5.7.2",
+        "dotenv": "^16.0.3"
+    }
+}
