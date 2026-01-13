@@ -67,17 +67,10 @@ async function run() {
                 await tx.wait();
                 console.log("   ✓ Snapshots taken!");
 
-                // Step 2: Start Claim Phase (allocates pools, sets isDistActive = true)
-                console.log("2. Starting claim phase...");
-                tx = await contract.startClaimPhase({ gasLimit: 1000000 });
-                console.log(`   TX: ${tx.hash}`);
-                await tx.wait();
-                console.log("   ✓ Claim phase started!");
-
-                // Step 3: Buy Reward Token (if set and ETH available)
+                // Step 2: Buy Reward Token FIRST (before allocating pools)
                 if (rewardToken !== ethers.constants.AddressZero) {
                     const ethAvailable = await contract.getAvailableEthForBuy();
-                    console.log(`3. Checking reward token purchase... (ETH available: ${ethers.utils.formatEther(ethAvailable)})`);
+                    console.log(`2. Checking reward token purchase... (ETH available: ${ethers.utils.formatEther(ethAvailable)})`);
 
                     if (ethAvailable.gt(0)) {
                         console.log("   Buying reward tokens...");
@@ -89,8 +82,15 @@ async function run() {
                         console.log("   No ETH available for purchase.");
                     }
                 } else {
-                    console.log("3. No reward token set (distributing ETH directly).");
+                    console.log("2. No reward token set (will distribute ETH directly).");
                 }
+
+                // Step 3: Start Claim Phase (allocates pools with purchased tokens/ETH)
+                console.log("3. Starting claim phase...");
+                tx = await contract.startClaimPhase({ gasLimit: 1000000 });
+                console.log(`   TX: ${tx.hash}`);
+                await tx.wait();
+                console.log("   ✓ Claim phase started!");
 
                 console.log("\n✓ Distribution phase is now active!");
             } else {
@@ -130,11 +130,12 @@ async function run() {
                 }
 
                 // End the cycle (sweeps unclaimed to treasury)
-                console.log("2. Ending cycle...");
+                console.log("2. Ending cycle (sweeping unclaimed to treasury)...");
                 const tx = await contract.endCycle({ gasLimit: 2000000 });
                 console.log(`   TX: ${tx.hash}`);
                 await tx.wait();
-                console.log("   ✓ Cycle ended! New accumulation phase started.");
+                console.log("   ✓ Cycle ended! Unclaimed rewards swept to treasury.");
+                console.log("   ✓ New accumulation phase started.");
 
             } else {
                 const remaining = cycleInterval.toNumber() - elapsed;
