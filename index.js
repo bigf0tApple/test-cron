@@ -6,8 +6,8 @@ const RPC_URL = process.env.RPC_URL || 'https://mainnet.base.org';
 const PRIVATE_KEY = process.env.PRIVATE_KEY;
 const REWARDS_CONTRACT = process.env.REWARDS_CONTRACT;
 
-// Cycle interval in seconds (3 hours)
-const CYCLE_INTERVAL = 3 * 60 * 60; // 10800 seconds
+// Minimum ETH balance required to run (prevents wasted gas on low balance)
+const MIN_ETH_BALANCE = ethers.utils.parseEther('0.001'); // 0.001 ETH
 
 // ABI for the functions we need
 const ABI = [
@@ -29,17 +29,37 @@ const ABI = [
     "function currentDisplayCycleId() external view returns (uint256)"
 ];
 
-// Helper function to add delay between calls
 function sleep(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-// Helper to format time
 function formatTime(seconds) {
     const h = Math.floor(seconds / 3600);
     const m = Math.floor((seconds % 3600) / 60);
     const s = seconds % 60;
     return `${h}h ${m}m ${s}s`;
+}
+
+// Simulate a call before sending - prevents wasted gas on reverts
+async function safeCall(contract, methodName, options = {}) {
+    console.log(`   Simulating ${methodName}()...`);
+    try {
+        // Static call first to check if it would succeed
+        await contract.callStatic[methodName](options);
+        console.log(`   ✓ Simulation passed, sending transaction...`);
+
+        // If simulation passed, send the real transaction
+        const tx = await contract[methodName](options);
+        console.log(`   TX: ${tx.hash}`);
+        await tx.wait();
+        console.log(`   ✓ ${methodName}() complete`);
+        return true;
+    } catch (error) {
+        const reason = error.reason || error.message || 'Unknown error';
+        console.log(`   ⚠ ${methodName}() would fail: ${reason}`);
+        console.log(`   → Skipping to save gas`);
+        return false;
+    }
 }
 
 async function run() {
@@ -57,11 +77,21 @@ async function run() {
         const wallet = new ethers.Wallet(PRIVATE_KEY, provider);
         const contract = new ethers.Contract(REWARDS_CONTRACT, ABI, wallet);
 
-        console.log(`Wallet: ${wallet.address}`);
-        console.log(`Contract: ${REWARDS_CONTRACT}`);
-        console.log(`RPC: ${RPC_URL}`);
+        // CHECK WALLET BALANCE FIRST
+        const balance = await provider.getBalance(wallet.address);
+        console.log(`\nWallet: ${wallet.address}`);
+        console.log(`Balance: ${ethers.utils.formatEther(balance)} ETH`);
 
-        // Get current state
+        if (balance.lt(MIN_ETH_BALANCE)) {
+            console.error(`\n❌ INSUFFICIENT BALANCE`);
+            console.error(`   Need at least ${ethers.utils.formatEther(MIN_ETH_BALANCE)} ETH for gas`);
+            console.error(`   Please fund the wallet and try again`);
+            process.exit(1);
+        }
+
+        console.log(`Contract: ${REWARDS_CONTRACT}`);
+
+        // Get current state (view calls - free, no gas)
         const isDistActive = await contract.isDistActive();
         const cycleInterval = await contract.cycleInterval();
         const displayCycleId = await contract.currentDisplayCycleId();
@@ -74,97 +104,80 @@ async function run() {
         console.log(`Cycle Interval: ${formatTime(cycleInterval.toNumber())}`);
         console.log(`Reward Token: ${rewardToken === ethers.constants.AddressZero ? 'ETH (none set)' : rewardToken}`);
 
-        // ==================== EPOCH TRANSITION SEQUENCE ====================
-        // This runs every 3 hours and handles the overlapping epochs:
-        // 1. Close previous epoch (if distribution is active)
-        // 2. Start new distribution for current accumulated epoch
-        // 3. New accumulation begins automatically
-
-        // STEP 1: Close previous epoch if distribution is active
+        // ==================== STEP 1: Close Previous Epoch ====================
         if (isDistActive) {
-            console.log(`\n[STEP 1] CLOSING PREVIOUS EPOCH (Cycle ${displayCycleId})`);
-
-            // Check if distribution period has elapsed
             const distStartTime = await contract.distStartTime();
             const distElapsed = now - distStartTime.toNumber();
+            console.log(`\n[STEP 1] CLOSING PREVIOUS EPOCH (Cycle ${displayCycleId})`);
             console.log(`   Distribution elapsed: ${formatTime(distElapsed)}`);
 
-            if (distElapsed >= cycleInterval.toNumber() - 300) { // 5 min buffer
-                // 1a. Flush remaining distributions
-                console.log(`   1a. Flushing remaining distributions...`);
-                try {
-                    const tx1 = await contract.flushDistributions({ gasLimit: 3000000 });
-                    console.log(`       TX: ${tx1.hash}`);
-                    await tx1.wait();
-                    console.log(`       ✓ Flush complete`);
-                } catch (e) {
-                    console.log(`       ⚠ Flush skipped: ${e.reason || 'nothing to flush'}`);
-                }
-                await sleep(2000); // 2 second delay
+            if (distElapsed >= cycleInterval.toNumber() - 300) {
+                // Flush distributions (with safe call)
+                console.log(`\n   1a. Flushing remaining distributions...`);
+                await safeCall(contract, 'flushDistributions', { gasLimit: 3000000 });
+                await sleep(2000);
 
-                // 1b. End the cycle (sweeps unclaimed → Treasury)
-                console.log(`   1b. Ending cycle (sweep→Treasury)...`);
-                const tx2 = await contract.endCycle({ gasLimit: 2000000 });
-                console.log(`       TX: ${tx2.hash}`);
-                await tx2.wait();
-                console.log(`       ✓ Cycle ended, unclaimed swept to Treasury`);
+                // End cycle (with safe call)
+                console.log(`\n   1b. Ending cycle...`);
+                const endSuccess = await safeCall(contract, 'endCycle', { gasLimit: 2000000 });
+                if (!endSuccess) {
+                    console.log(`\n⚠ Could not end cycle. Check contract state.`);
+                    process.exit(0);
+                }
                 await sleep(2000);
             } else {
                 const remaining = cycleInterval.toNumber() - distElapsed;
                 console.log(`   ⏳ Not time yet. ${formatTime(remaining)} remaining.`);
-                console.log(`\n✓ Cron job complete (waiting for distribution period to end)`);
+                console.log(`\n✓ Cron job complete (waiting)`);
                 return;
             }
         } else {
-            console.log(`\n[STEP 1] No active distribution to close (first epoch or already closed)`);
+            console.log(`\n[STEP 1] No active distribution to close`);
         }
 
-        // STEP 2: Check if accumulation period has completed
+        // ==================== STEP 2: Start New Epoch ====================
         const accStartTime = await contract.accStartTime();
         const accElapsed = now - accStartTime.toNumber();
         console.log(`\n[STEP 2] CHECKING ACCUMULATION STATUS`);
         console.log(`   Accumulation elapsed: ${formatTime(accElapsed)}`);
 
-        if (accElapsed >= cycleInterval.toNumber() - 300) { // 5 min buffer
-            console.log(`   ✓ Accumulation period complete. Starting transition...`);
+        if (accElapsed >= cycleInterval.toNumber() - 300) {
+            console.log(`   ✓ Accumulation complete. Starting transition...`);
 
-            // 2a. Take snapshots of holders
+            // Take snapshots
             console.log(`\n   2a. Taking holder snapshots...`);
-            const tx3 = await contract.takeSnapshots({ gasLimit: 3000000 });
-            console.log(`       TX: ${tx3.hash}`);
-            await tx3.wait();
-            console.log(`       ✓ Snapshots captured`);
+            const snapshotSuccess = await safeCall(contract, 'takeSnapshots', { gasLimit: 3000000 });
+            if (!snapshotSuccess) {
+                console.log(`\n⚠ Snapshot failed. Stopping.`);
+                process.exit(0);
+            }
             await sleep(2000);
 
-            // 2b. Buy reward token with accumulated ETH (if reward token set)
+            // Buy reward token (if set)
             if (rewardToken !== ethers.constants.AddressZero) {
                 const ethAvailable = await contract.getAvailableEthForBuy();
                 console.log(`\n   2b. Buying reward tokens (${ethers.utils.formatEther(ethAvailable)} ETH available)...`);
 
                 if (ethAvailable.gt(0)) {
-                    const tx4 = await contract.buyRewardToken({ gasLimit: 500000 });
-                    console.log(`       TX: ${tx4.hash}`);
-                    await tx4.wait();
-                    console.log(`       ✓ Reward tokens purchased`);
+                    await safeCall(contract, 'buyRewardToken', { gasLimit: 500000 });
                 } else {
-                    console.log(`       ⚠ No ETH available for purchase`);
+                    console.log(`   → No ETH available, skipping`);
                 }
                 await sleep(2000);
             } else {
                 console.log(`\n   2b. No reward token set (distributing ETH directly)`);
             }
 
-            // 2c. Start claim phase (allocates pools, sets isDistActive=true)
+            // Start claim phase
             console.log(`\n   2c. Starting claim phase...`);
-            const tx5 = await contract.startClaimPhase({ gasLimit: 1000000 });
-            console.log(`       TX: ${tx5.hash}`);
-            await tx5.wait();
-            console.log(`       ✓ Claim phase started`);
-            console.log(`       ✓ New accumulation epoch started automatically`);
+            const startSuccess = await safeCall(contract, 'startClaimPhase', { gasLimit: 1000000 });
+            if (startSuccess) {
+                console.log(`   ✓ New distribution epoch started!`);
+            }
 
         } else {
             const remaining = cycleInterval.toNumber() - accElapsed;
-            console.log(`   ⏳ Not time yet. ${formatTime(remaining)} remaining until transition.`);
+            console.log(`   ⏳ Not time yet. ${formatTime(remaining)} remaining.`);
         }
 
         console.log(`\n${'='.repeat(60)}`);
@@ -173,9 +186,6 @@ async function run() {
 
     } catch (error) {
         console.error(`\n❌ ERROR: ${error.reason || error.message}`);
-        if (error.error?.data) {
-            console.error(`   Data: ${error.error.data}`);
-        }
         process.exit(1);
     }
 }
