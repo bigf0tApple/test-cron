@@ -7,7 +7,8 @@
         "start": "node index.js"
     },
     "dependencies": {
-        "ethers": "^5.7.2",
-        "dotenv": "^16.0.3"
+        "@gelatonetwork/automate-sdk": "^3.1.0",
+        "dotenv": "^16.0.3",
+        "ethers": "^5.8.0"
     }
 }
