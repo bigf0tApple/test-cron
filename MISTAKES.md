@@ -35,6 +35,27 @@
 **Issue**: DexScreener/Uniswap UI rounds for display purposes
 **Reality**: On-chain math is precisely 1.618%
 
+### 8. Auto Pools Swept to Treasury Instead of Distributed
+**Mistake**: `endCycle()` was sweeping `remainingNftAuto + remainingTokenAuto` to treasury
+**Problem**: Auto pools should be DISTRIBUTED to holders, not sent to treasury
+**What SHOULD go to treasury**: Only `excessNftRewards` (beyond 342 cap) + `unclaimedTokenManual`
+**Fix**: Updated `endCycle()` to only sweep excess/unclaimed, not auto pools
+**Status**: ⚠️ FIXED IN SOURCE - REQUIRES REDEPLOYMENT
+
+### 9. enableTrading() Never Called After Deployment (2026-01-14)
+**Mistake**: After deploying 66M contracts and adding liquidity, `enableTrading()` was never called
+**Problem**: Tax collection code requires `launchBlock > 0` to apply taxes:
+```solidity
+if (launchBlock > 0 && (isBuy || isSell)) {
+    // Tax only collected when launchBlock is set
+}
+```
+**Result**: 24 hours of trading with **ZERO tax collected** - all trades were tax-free
+**Why Trading Still Worked**: Transfers aren't blocked, only the tax calculation is skipped
+**Fix**: Called `enableTrading()` - TX `0xd9bb886daf9692e8fa2a3a831743ed9afb82183afe557af91f67a44355004e2f`
+**Lesson**: Add `enableTrading()` to deployment checklist AND verify `getTaxStats()` after first trade
+**Status**: ✅ FIXED - Taxes now collecting properly (launchBlock = 40804276)
+
 ---
 
 ## Deployment Checklist (Don't Forget!)
@@ -73,9 +94,10 @@
 - [ ] NFTContract.setWethUsdcPair()
 - [ ] NFTContract.setSolUsdcPair()
 
-### Enable Trading
+### Enable Trading (⚠️ CRITICAL!)
 - [ ] Add liquidity (TOKEN/WETH pair)
-- [ ] MainToken.enableTrading()
+- [ ] **MainToken.enableTrading()** ← DO NOT FORGET!
+- [ ] Verify with `getTaxStats()` after first trade to confirm taxes collecting
 
 ---
 
@@ -90,3 +112,40 @@
 7. Block-based vesting (1-month cliff)
 8. Presale → USDC swap
 9. PYTH oracle with Uniswap fallback
+
+---
+
+## 66M Deployment (2026-01-13)
+
+### Deployed Contracts (Base Mainnet Block 40758777)
+| Contract | Address |
+|----------|---------|
+| MainToken (66M/66M) | `0x49250e21a4fdfe969172a5548de96104dae7d26f` |
+| TokenTracker | `0x4995DcA875f2aafA1f2694dF1B3bD6eFfcd2995C` |
+| NFTTracker | `0x64c415a80be6fbd8f24fd14744a70adc277f3362` |
+| Rewards | `0x9945116E0f2B6fB6ba5A3d1a3aA938bf6B7211CF` |
+| TokenLocker | `0xb3960d6fbA22F122614ea0B559BC1d18f7184874` |
+
+### Tokenomics (4-Wallet Vesting)
+| Wallet | Amount | % |
+|--------|--------|---|
+| Dev | 134.7M | 13.47% |
+| Core | 115.2M | 11.52% |
+| Spillage | 57.2M | 5.72% |
+| Free Wee | 74.9M | 7.49% |
+| Deployer (Presale+LP) | 618M | 61.8% |
+
+### 38-Month Decaying Vesting
+- Period 1 (Months 1-10): 1.0x rate
+- Period 2 (Months 11-22): 0.75x rate
+- Period 3 (Months 23-38): 0.375x rate
+
+### What Was Done
+1. ✅ Recovered funds from old 66Mtest contracts (RewardsContract ETH + TokenLocker tokens)
+2. ✅ Deployed new 66M token ecosystem via Deploy66M.s.sol
+3. ✅ All linking done in deployment script (setTokenTracker, setRewardsContract, setTokenLocker, setUniswapRouter)
+4. ⏳ Still needed: NFT deployment, Uniswap pair creation, enableTrading()
+
+### New Features Added
+- Piggyback token flush in NFTContract: `_flushTokensToMintFund()` forwards accumulated tokens to NFT_MINT_FUND on every mint
+
