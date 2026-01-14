@@ -142,12 +142,12 @@ async function run() {
 
             // Flush any remaining distributions
             console.log(`\n[1/2] Flushing distributions...`);
-            await safeCall(contract, 'flushDistributions', { gasLimit: 3000000 });
+            await safeCall(contract, 'flushDistributions', { gasLimit: 500000 });
             await sleep(3000);
 
             // End cycle (sweep unclaimed → swap → treasury)
             console.log(`\n[2/2] Ending cycle (sweep to treasury)...`);
-            await safeCall(contract, 'endCycle', { gasLimit: 2000000 });
+            await safeCall(contract, 'endCycle', { gasLimit: 500000 });
             await sleep(3000);
 
             console.log(`\n✓ Distribution cycle ${cycleId} ENDED`);
@@ -173,7 +173,7 @@ async function run() {
 
         // 1. Take snapshots
         console.log(`\n[1/3] Taking holder snapshots...`);
-        const snapOk = await safeCall(contract, 'takeSnapshots', { gasLimit: 5000000 });
+        const snapOk = await safeCall(contract, 'takeSnapshots', { gasLimit: 500000 });
         if (!snapOk) {
             console.log(`❌ Snapshot failed, aborting`);
             process.exit(1);
