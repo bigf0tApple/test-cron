@@ -94,7 +94,7 @@ contract RewardsContract is Ownable, ReentrancyGuard {
     mapping(address => uint256) public withdrawnDividends;
 
     // ============ BATCHING ============
-    uint256 public snapshotBatchSize = 4000;  // Holders per snapshot batch
+    uint256 public snapshotBatchSize = 8000;  // Holders per snapshot batch (can change via setSnapshotBatchSize)
     uint256 public distributeBatchSize = 100; // Holders per distribute batch
     
     // Snapshot progress tracking

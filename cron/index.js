@@ -1,18 +1,18 @@
 /**
  * ====================================================================
- * RAILWAY1: EPOCH AUTOMATION SERVICE
+ * RAILWAY1: EPOCH AUTOMATION SERVICE (Continuous Mode)
  * ====================================================================
  * 
- * This service automates the RewardsContract epoch cycle:
- * - Calls batchStartEpoch() repeatedly until snapshot completes
- * - Calls batchEndCycle() when distribution period ends
+ * This service runs ONCE when triggered, loops until epoch is complete,
+ * then exits. Designed to be triggered by Railway scheduler at 6H mark.
  * 
- * NEW BEHAVIOR (v2):
- * - ETH is FROZEN on FIRST batchStartEpoch() call at 6H mark
- * - Subsequent calls continue the batched snapshot
- * - Final call triggers buy + distribution start
+ * FLOW:
+ * 1. Check if epoch complete (6H passed)
+ * 2. If yes, call batchStartEpoch() back-to-back until done
+ * 3. Exit when distribution is started
+ * 4. Separately handle batchEndCycle() at distribution end
  * 
- * RUN: node index.js (via Railway cron every 5 minutes)
+ * RUN: Trigger once every 6 hours via Railway scheduler
  * ====================================================================
  */
 
@@ -23,7 +23,10 @@ const { ethers } = require('ethers');
 const RPC_URL = process.env.RPC_URL || 'https://mainnet.base.org';
 const PRIVATE_KEY = process.env.RAILWAY_PRIVATE_KEY;
 const REWARDS_CONTRACT = process.env.REWARDS_CONTRACT;
-const MIN_ETH_BALANCE = ethers.utils.parseEther('0.0005');
+const MIN_ETH_BALANCE = ethers.utils.parseEther('0.001');
+
+// Delay between calls (milliseconds) - just enough to avoid rate limits
+const CALL_DELAY_MS = 2000; // 2 seconds between calls
 
 // ====== ABI ======
 const ABI = [
@@ -47,42 +50,39 @@ const ABI = [
 // ====== HELPERS ======
 const formatTime = (s) => `${Math.floor(s / 3600)}h ${Math.floor((s % 3600) / 60)}m ${s % 60}s`;
 const formatEth = (wei) => ethers.utils.formatEther(wei);
+const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+function log(msg) {
+    console.log(`[${new Date().toISOString()}] ${msg}`);
+}
 
 async function safeCall(contract, method, options = {}) {
-    console.log(`   → Simulating ${method}()...`);
+    log(`→ Calling ${method}()...`);
     try {
+        // Simulate first
         await contract.callStatic[method](options);
-        console.log(`   → Simulation OK, sending tx...`);
+
+        // Execute
         const tx = await contract[method](options);
-        console.log(`   → TX: ${tx.hash}`);
+        log(`  TX: ${tx.hash}`);
         const receipt = await tx.wait();
-        console.log(`   ✓ ${method}() SUCCESS (gas: ${receipt.gasUsed.toString()})`);
-        return true;
+        log(`  ✓ SUCCESS (gas: ${receipt.gasUsed.toString()})`);
+        return { success: true, receipt };
     } catch (error) {
         const reason = error.reason || error.message;
-        // Don't log as error if it's just "Cycle not complete"
-        if (reason.includes('Cycle not complete') || reason.includes('Distribution already active')) {
-            console.log(`   ⏳ ${method}(): ${reason}`);
-        } else {
-            console.log(`   ✗ ${method}() FAILED: ${reason}`);
-        }
-        return false;
+        log(`  ✗ FAILED: ${reason}`);
+        return { success: false, reason };
     }
 }
 
-// ====== MAIN ======
-async function run() {
-    console.log(`\n${'═'.repeat(60)}`);
-    console.log(`[${new Date().toISOString()}] RAILWAY1: EPOCH AUTOMATION`);
-    console.log(`${'═'.repeat(60)}`);
+// ====== MAIN: START EPOCH ======
+async function runStartEpoch() {
+    log(`${'═'.repeat(60)}`);
+    log(`RAILWAY1: START EPOCH (Continuous Mode)`);
+    log(`${'═'.repeat(60)}`);
 
-    if (!PRIVATE_KEY) {
-        console.error("❌ Missing RAILWAY_PRIVATE_KEY in .env");
-        process.exit(1);
-    }
-
-    if (!REWARDS_CONTRACT) {
-        console.error("❌ Missing REWARDS_CONTRACT in .env");
+    if (!PRIVATE_KEY || !REWARDS_CONTRACT) {
+        log("❌ Missing RAILWAY_PRIVATE_KEY or REWARDS_CONTRACT in .env");
         process.exit(1);
     }
 
@@ -92,112 +92,168 @@ async function run() {
 
     // Check balance
     const balance = await provider.getBalance(wallet.address);
-    console.log(`\nWallet: ${wallet.address}`);
-    console.log(`Balance: ${formatEth(balance)} ETH`);
+    log(`Wallet: ${wallet.address}`);
+    log(`Balance: ${formatEth(balance)} ETH`);
 
     if (balance.lt(MIN_ETH_BALANCE)) {
-        console.error(`❌ Need at least ${formatEth(MIN_ETH_BALANCE)} ETH`);
+        log(`❌ Need at least ${formatEth(MIN_ETH_BALANCE)} ETH`);
         process.exit(1);
     }
 
     // Get contract state
     const now = Math.floor(Date.now() / 1000);
-    const isDistActive = await contract.isDistActive();
     const cycleInterval = (await contract.cycleInterval()).toNumber();
-    const cycleId = await contract.currentDisplayCycleId();
-
-    console.log(`\n─── Contract State ───`);
-    console.log(`Cycle ID: ${cycleId}`);
-    console.log(`Distribution Active: ${isDistActive}`);
-    console.log(`Cycle Interval: ${formatTime(cycleInterval)}`);
-
-    // ============================================================
-    // STEP 1: END DISTRIBUTION IF TIME (batchEndCycle)
-    // ============================================================
-    if (isDistActive) {
-        const distStartTime = (await contract.distStartTime()).toNumber();
-        const distElapsed = now - distStartTime;
-        const distRemaining = Math.max(0, cycleInterval - distElapsed);
-
-        console.log(`\n─── Distribution Status ───`);
-        console.log(`Elapsed: ${formatTime(distElapsed)}`);
-        console.log(`Remaining: ${formatTime(distRemaining)}`);
-
-        if (distElapsed >= cycleInterval) {
-            console.log(`\n🔄 ENDING DISTRIBUTION with batchEndCycle()...`);
-            const success = await safeCall(contract, 'batchEndCycle', { gasLimit: 1500000 });
-            if (success) {
-                console.log(`✓ Distribution cycle ENDED`);
-            }
-        } else {
-            console.log(`\n⏳ Distribution still running. ${formatTime(distRemaining)} left.`);
-        }
-    }
-
-    // ============================================================
-    // STEP 2: START/CONTINUE EPOCH (batchStartEpoch)
-    // This may need multiple calls for batched snapshots
-    // ============================================================
     const accStartTime = (await contract.accStartTime()).toNumber();
     const accElapsed = now - accStartTime;
-    const accRemaining = Math.max(0, cycleInterval - accElapsed);
+    const cycleId = await contract.currentDisplayCycleId();
 
-    console.log(`\n─── Accumulation Status ───`);
-    console.log(`Elapsed: ${formatTime(accElapsed)}`);
-    console.log(`Remaining: ${formatTime(accRemaining)}`);
+    log(`\n─── Status ───`);
+    log(`Cycle ID: ${cycleId}`);
+    log(`Cycle Interval: ${formatTime(cycleInterval)}`);
+    log(`Time Elapsed: ${formatTime(accElapsed)}`);
 
-    // Check if snapshot is in progress (means we need to continue it)
-    const snapshotInProgress = await contract.isSnapshotInProgress();
+    // Check if epoch ready
+    if (accElapsed < cycleInterval) {
+        const remaining = cycleInterval - accElapsed;
+        log(`\n⏳ Epoch not complete yet. ${formatTime(remaining)} remaining.`);
+        log(`✓ Nothing to do, exiting.`);
+        return;
+    }
 
-    if (snapshotInProgress) {
-        // Snapshot already started, continue it
-        const progress = await contract.getSnapshotProgress();
-        console.log(`\n─── Snapshot Progress ───`);
-        console.log(`NFT: ${progress.nftProgress}/${progress.nftTotal} (done: ${progress.nftDone})`);
-        console.log(`Token: ${progress.tokenProgress}/${progress.tokenTotal} (done: ${progress.tokenDone})`);
+    log(`\n🚀 EPOCH COMPLETE - Starting continuous processing...`);
 
-        console.log(`\n🔄 CONTINUING SNAPSHOT with batchStartEpoch()...`);
-        await safeCall(contract, 'batchStartEpoch', { gasLimit: 2000000 });
-    } else if (accElapsed >= cycleInterval) {
-        // Start new epoch (first batch call - this also freezes ETH!)
-        console.log(`\n🔄 STARTING NEW EPOCH with batchStartEpoch()...`);
-        console.log(`   (ETH will be FROZEN for this cycle on this first call)`);
-        const success = await safeCall(contract, 'batchStartEpoch', { gasLimit: 2000000 });
-        if (success) {
-            // Check if we need more batches
-            const stillInProgress = await contract.isSnapshotInProgress();
-            if (stillInProgress) {
-                console.log(`   → Snapshot started, needs more batches (Railway will continue)`);
+    // ============================================================
+    // CONTINUOUS LOOP: Call batchStartEpoch until done
+    // ============================================================
+    let batchCount = 0;
+    let done = false;
+
+    while (!done) {
+        batchCount++;
+        log(`\n─── Batch ${batchCount} ───`);
+
+        // Check progress before call
+        const snapshotInProgress = await contract.isSnapshotInProgress();
+        if (snapshotInProgress) {
+            const progress = await contract.getSnapshotProgress();
+            log(`NFT: ${progress.nftProgress}/${progress.nftTotal} (done: ${progress.nftDone})`);
+            log(`Token: ${progress.tokenProgress}/${progress.tokenTotal} (done: ${progress.tokenDone})`);
+        }
+
+        // Call batchStartEpoch
+        const result = await safeCall(contract, 'batchStartEpoch', { gasLimit: 3000000 });
+
+        if (!result.success) {
+            if (result.reason.includes('Distribution already active')) {
+                // This means we finished and distribution started
+                log(`\n✅ EPOCH COMPLETE! Distribution is now active.`);
+                done = true;
+            } else if (result.reason.includes('Cycle not complete')) {
+                // This shouldn't happen but handle it
+                log(`\n⚠️ Cycle not complete. Exiting.`);
+                done = true;
             } else {
-                console.log(`   → Snapshot complete, epoch started!`);
+                // Real error
+                log(`\n❌ Unexpected error. Exiting.`);
+                done = true;
+            }
+        } else {
+            // Check if we're done after successful call
+            const stillInProgress = await contract.isSnapshotInProgress();
+            const isDistActive = await contract.isDistActive();
+
+            if (isDistActive) {
+                log(`\n✅ EPOCH COMPLETE! Distribution is now active.`);
+                done = true;
+            } else if (!stillInProgress) {
+                // Snapshot done but distribution not active yet? Check again
+                log(`Checking if distribution started...`);
+                await sleep(1000);
+                const distActive = await contract.isDistActive();
+                if (distActive) {
+                    log(`\n✅ EPOCH COMPLETE! Distribution is now active.`);
+                    done = true;
+                }
             }
         }
-    } else {
-        console.log(`\n⏳ Accumulation still running. ${formatTime(accRemaining)} left.`);
+
+        if (!done) {
+            // Small delay between calls to avoid rate limits
+            await sleep(CALL_DELAY_MS);
+        }
     }
 
-    // Show current ETH raised
+    // Show final status
     try {
         const epochInfo = await contract.getCurrentEpochInfo();
-        console.log(`\n─── Current Epoch Info ───`);
-        console.log(`Cycle: ${epochInfo.cycleId}`);
-        console.log(`ETH Raised: ${formatEth(epochInfo.ethRaised)} ETH`);
-        console.log(`ETH for Rewards: ${formatEth(epochInfo.ethForRewards)} ETH`);
+        log(`\n─── New Epoch Info ───`);
+        log(`Cycle: ${epochInfo.cycleId}`);
+        log(`ETH Raised (new cycle): ${formatEth(epochInfo.ethRaised)} ETH`);
     } catch (e) {
         // Old contract without this function
-        const ethForBuy = await contract.getAvailableEthForBuy();
-        console.log(`\n─── ETH Status ───`);
-        console.log(`Available for Rewards: ${formatEth(ethForBuy)} ETH`);
     }
 
-    console.log(`\n${'═'.repeat(60)}`);
-    console.log(`✓ RAILWAY1 COMPLETE`);
-    console.log(`${'═'.repeat(60)}\n`);
+    log(`\n${'═'.repeat(60)}`);
+    log(`✅ RAILWAY1 COMPLETE - Processed ${batchCount} batches`);
+    log(`${'═'.repeat(60)}`);
 }
 
-run()
-    .then(() => process.exit(0))
-    .catch((e) => {
-        console.error(`\n❌ FATAL: ${e.message}`);
+// ====== MAIN: END CYCLE ======
+async function runEndCycle() {
+    log(`${'═'.repeat(60)}`);
+    log(`RAILWAY1: END CYCLE`);
+    log(`${'═'.repeat(60)}`);
+
+    if (!PRIVATE_KEY || !REWARDS_CONTRACT) {
+        log("❌ Missing config");
         process.exit(1);
-    });
+    }
+
+    const provider = new ethers.providers.JsonRpcProvider(RPC_URL);
+    const wallet = new ethers.Wallet(PRIVATE_KEY, provider);
+    const contract = new ethers.Contract(REWARDS_CONTRACT, ABI, wallet);
+
+    const isDistActive = await contract.isDistActive();
+    if (!isDistActive) {
+        log("No active distribution to end.");
+        return;
+    }
+
+    const now = Math.floor(Date.now() / 1000);
+    const cycleInterval = (await contract.cycleInterval()).toNumber();
+    const distStartTime = (await contract.distStartTime()).toNumber();
+    const distElapsed = now - distStartTime;
+
+    log(`Distribution elapsed: ${formatTime(distElapsed)}`);
+
+    if (distElapsed < cycleInterval) {
+        log(`⏳ Distribution not complete yet. ${formatTime(cycleInterval - distElapsed)} remaining.`);
+        return;
+    }
+
+    log(`🔄 Ending distribution...`);
+    await safeCall(contract, 'batchEndCycle', { gasLimit: 1500000 });
+
+    log(`\n${'═'.repeat(60)}`);
+    log(`✅ CYCLE ENDED`);
+    log(`${'═'.repeat(60)}`);
+}
+
+// ====== ENTRY POINT ======
+const mode = process.argv[2] || 'start';
+
+if (mode === 'end') {
+    runEndCycle()
+        .then(() => process.exit(0))
+        .catch((e) => {
+            console.error(`❌ FATAL: ${e.message}`);
+            process.exit(1);
+        });
+} else {
+    runStartEpoch()
+        .then(() => process.exit(0))
+        .catch((e) => {
+            console.error(`❌ FATAL: ${e.message}`);
+            process.exit(1);
+        });
+}
